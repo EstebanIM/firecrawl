@@ -12,12 +12,16 @@ src/app/
 ├── api/
 │   ├── products/
 │   │   ├── search/route.ts          GET  /api/products/search?q=...&category=...&brand=...
-│   │   ├── [id]/route.ts            GET  /api/products/[id]
-│   │   ├── [id]/history/route.ts    GET  /api/products/[id]/history?store=...&days=90
-│   │   └── [id]/prices/route.ts     GET  /api/products/[id]/prices
+│   │   ├── suggest/route.ts         GET  /api/products/suggest?q=...  (autocomplete)
+│   │   ├── compare/route.ts         GET  /api/products/compare?slugs=a,b,c
+│   │   ├── [slug]/route.ts          GET  /api/products/[slug]
+│   │   ├── [slug]/history/route.ts  GET  /api/products/[slug]/history?store=...&days=90
+│   │   └── [slug]/prices/route.ts   GET  /api/products/[slug]/prices
 │   ├── categories/
 │   │   └── route.ts                 GET  /api/categories
 │   │   └── [slug]/route.ts          GET  /api/categories/[slug]
+│   ├── brands/
+│   │   └── route.ts                 GET  /api/brands
 │   ├── stores/
 │   │   └── route.ts                 GET  /api/stores
 │   │   └── [slug]/route.ts          GET  /api/stores/[slug]
@@ -28,6 +32,26 @@ src/app/
 │       ├── jobs/route.ts            GET  /api/admin/jobs
 │       └── jobs/[id]/route.ts       GET  /api/admin/jobs/[id]
 ```
+
+> **NOTA**: Las rutas de producto usan `[slug]` (no `[id]`) para coincidir con
+> las URLs del frontend (`/producto/[slug]`). Paginas accedidas por SEO o links
+> compartidos solo tienen el slug; no hay necesidad de un round-trip slug→ID.
+
+## Formato de Errores Estandar
+
+Todos los endpoints usan el mismo envelope para errores:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Descripcion legible del error",
+    "details": [{ "field": "q", "message": "Search query is required" }]
+  }
+}
+```
+
+Codigos HTTP: `400` (validation), `401` (unauthorized), `404` (not found), `429` (rate limited), `500` (server error).
 
 ## Endpoints Detallados
 
@@ -85,7 +109,8 @@ export async function GET(request: NextRequest) {
       "storeName": "PCFactory",
       "storeSlug": "pcfactory",
       "storeCount": 5,
-      "discountPct": 19
+      "discountPct": 19,
+      "lastScrapedAt": "2026-03-23T08:00:00Z"
     }
   ],
   "pagination": {
@@ -97,9 +122,9 @@ export async function GET(request: NextRequest) {
 }
 ```
 
-### GET /api/products/[id]
+### GET /api/products/[slug]
 
-Detalle de un producto con precios en todas las tiendas.
+Detalle de un producto con precios en todas las tiendas. Usa slug (no ID) para coincidir con URLs de frontend.
 
 **Respuesta:**
 ```json
@@ -142,7 +167,7 @@ Detalle de un producto con precios en todas las tiendas.
 }
 ```
 
-### GET /api/products/[id]/history
+### GET /api/products/[slug]/history
 
 Historial de precios para graficos.
 
@@ -155,21 +180,30 @@ Historial de precios para graficos.
 **Respuesta:**
 ```json
 {
-  "productId": 1,
+  "productSlug": "notebook-lenovo-ideapad-3-15-amd-ryzen-5-8gb-256gb",
   "productName": "Notebook Lenovo IdeaPad 3...",
-  "history": {
-    "pcfactory": [
-      { "date": "2026-01-15", "price": 549990, "offerPrice": null },
-      { "date": "2026-01-20", "price": 549990, "offerPrice": 499990 },
-      { "date": "2026-02-01", "price": 529990, "offerPrice": 429990 }
-    ],
-    "falabella": [
-      { "date": "2026-01-15", "price": 579990, "offerPrice": null },
-      { "date": "2026-02-10", "price": 549990, "offerPrice": null }
-    ]
-  }
+  "history": [
+    {
+      "store": { "slug": "pcfactory", "name": "PCFactory" },
+      "prices": [
+        { "date": "2026-01-15", "price": 549990, "offerPrice": null },
+        { "date": "2026-01-20", "price": 549990, "offerPrice": 499990 },
+        { "date": "2026-02-01", "price": 529990, "offerPrice": 429990 }
+      ]
+    },
+    {
+      "store": { "slug": "falabella", "name": "Falabella" },
+      "prices": [
+        { "date": "2026-01-15", "price": 579990, "offerPrice": null },
+        { "date": "2026-02-10", "price": 549990, "offerPrice": null }
+      ]
+    }
+  ]
 }
 ```
+
+> **Cambio vs version anterior**: La respuesta usa un array de objetos (no object-keyed-by-slug)
+> para mejor tipado en TypeScript y consistencia. Incluye nombre de tienda para evitar lookups extra.
 
 ### GET /api/deals
 
@@ -212,8 +246,12 @@ const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 
 export async function POST(request: NextRequest) {
   const apiKey = request.headers.get('x-api-key');
-  if (apiKey !== ADMIN_API_KEY) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  // Usar timingSafeEqual para prevenir timing attacks
+  if (!apiKey || !crypto.timingSafeEqual(
+    Buffer.from(apiKey),
+    Buffer.from(ADMIN_API_KEY!)
+  )) {
+    return NextResponse.json({ error: { code: 'UNAUTHORIZED', message: 'Invalid API key' } }, { status: 401 });
   }
 
   const body = await request.json();
@@ -250,6 +288,45 @@ Estado de jobs de scraping.
 }
 ```
 
+### GET /api/products/suggest
+
+Autocomplete ligero para el SearchBar. Usa trigram search con LIMIT 8.
+Respuesta minima para velocidad (debounce 250ms en frontend).
+
+```typescript
+export async function GET(request: NextRequest) {
+  const q = request.nextUrl.searchParams.get('q') || '';
+  if (q.length < 2) return NextResponse.json({ data: [] });
+
+  // Trigram search con limite bajo para velocidad
+  const results = await db.select({
+    name: products.name,
+    slug: products.slug,
+    imageUrl: products.imageUrl,
+  })
+  .from(products)
+  .where(sql`similarity(${products.name}, ${q}) > 0.2`)
+  .orderBy(sql`similarity(${products.name}, ${q}) DESC`)
+  .limit(8);
+
+  return NextResponse.json({ data: results });
+}
+```
+
+### GET /api/brands
+
+Lista de marcas con conteo de productos. Necesario para filtros de busqueda.
+
+**Respuesta:**
+```json
+{
+  "data": [
+    { "name": "Samsung", "slug": "samsung", "productCount": 342 },
+    { "name": "Lenovo", "slug": "lenovo", "productCount": 189 }
+  ]
+}
+```
+
 ## Service Layer
 
 ```typescript
@@ -259,17 +336,23 @@ class ProductService {
   /** Buscar productos con full-text search */
   async search(params: SearchParams): Promise<PaginatedResult<ProductSummary>>
 
-  /** Obtener producto con precios actuales en todas las tiendas */
-  async getById(id: number): Promise<ProductDetail | null>
+  /** Obtener producto por slug con precios actuales en todas las tiendas */
+  async getBySlug(slug: string): Promise<ProductDetail | null>
+
+  /** Autocomplete (trigram, max 8 resultados) */
+  async suggest(q: string): Promise<ProductSuggestion[]>
 
   /** Historial de precios */
-  async getPriceHistory(productId: number, options: HistoryOptions): Promise<PriceHistory>
+  async getPriceHistory(productSlug: string, options: HistoryOptions): Promise<PriceHistory>
 
   /** Mejores ofertas */
   async getDeals(params: DealParams): Promise<ProductDeal[]>
 
   /** Productos por categoria */
   async getByCategory(slug: string, pagination: Pagination): Promise<PaginatedResult<ProductSummary>>
+
+  /** Comparar 2-4 productos side-by-side */
+  async compare(slugs: string[]): Promise<ProductDetail[]>
 }
 
 // src/lib/services/store-service.ts
@@ -329,10 +412,60 @@ async function cached<T>(key: string, fn: () => Promise<T>, options: CacheOption
 | Lista de tiendas | 1 hora | `stores` | Manual |
 | Deals | 15 min | `deals:{hash(params)}` | TTL natural |
 
+## Invalidacion de Cache Post-Scraping
+
+Despues de que un ciclo de scraping completa y las vistas materializadas se refrescan:
+
+```typescript
+// src/lib/cache.ts
+
+/** Invalidar caches de productos scrapeados */
+async function invalidateAfterScrape(productIds: number[]): Promise<void> {
+  const pipeline = redis.pipeline();
+
+  for (const id of productIds) {
+    pipeline.del(`product:${id}`);
+    // Invalidar todos los periodos de historial
+    const historyKeys = await redis.keys(`history:${id}:*`);
+    for (const key of historyKeys) pipeline.del(key);
+  }
+
+  // Deals y search se invalidan por TTL natural (5-15 min)
+  pipeline.del('deals:*');  // o usar SCAN para borrado por patron
+
+  await pipeline.exec();
+}
+```
+
+## Data Fetching Strategy
+
+### Server Components (RSC)
+Paginas publicas llaman al service layer **directamente** (sin HTTP):
+```typescript
+// src/app/producto/[slug]/page.tsx (RSC)
+const product = await productService.getBySlug(params.slug);
+// NO hacer: const res = await fetch('/api/products/...')
+```
+
+### Client Components
+Componentes interactivos (busqueda, filtros) usan **SWR** contra API routes:
+```typescript
+// src/components/search/SearchResults.tsx ("use client")
+const { data } = useSWR(`/api/products/search?${params}`, fetcher);
+```
+
+### API Routes
+Existen para: client-side fetching, futura API publica, admin endpoints.
+Los RSC **nunca** llaman a sus propias API routes — seria un round-trip innecesario.
+
 ## Seguridad
 
-- **Admin endpoints**: Protegidos con `x-api-key` header (API key en `.env`)
-- **Rate limiting**: Limitar requests publicos con Redis (ej: 100 req/min por IP)
+- **Admin endpoints**: Protegidos con `x-api-key` header + `crypto.timingSafeEqual()`
+- **Rate limiting**: `@upstash/ratelimit` con Redis, sliding window:
+  - Publicos: 100 req/min por IP
+  - Search: 30 req/min por IP (mas costoso)
+  - Admin: 10 req/min por API key
+  - Respuesta: `429 Too Many Requests` con headers `Retry-After` y `X-RateLimit-Remaining`
 - **Input validation**: Zod schemas en todos los endpoints
 - **SQL injection**: Imposible con Drizzle ORM (queries parametrizadas)
 - **CORS**: Configurar solo para dominio propio en produccion

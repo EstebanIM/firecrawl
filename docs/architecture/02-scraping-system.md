@@ -75,6 +75,12 @@ interface StoreScraper {
   /** Delay entre scrapes a esta tienda (ms) - rate limiting */
   readonly delayBetweenRequests: number;
 
+  /** Estrategia de espera para carga de pagina */
+  readonly waitStrategy: 'domcontentloaded' | 'networkidle' | 'commit';
+
+  /** Tipos de recursos a bloquear (default: ['image', 'media', 'font']) */
+  readonly blockedResources?: ('image' | 'media' | 'font' | 'stylesheet')[];
+
   /**
    * Scrapea un producto individual.
    * Recibe la pagina de Playwright ya navegada a la URL.
@@ -111,6 +117,8 @@ abstract class BaseScraper implements StoreScraper {
   abstract readonly selectors: StoreSelectors;
   readonly pageTimeout = 15000;      // 15 segundos default
   readonly delayBetweenRequests = 2000; // 2 segundos entre requests
+  readonly waitStrategy: 'domcontentloaded' | 'networkidle' | 'commit' = 'domcontentloaded';
+  readonly blockedResources?: ('image' | 'media' | 'font' | 'stylesheet')[];
 
   async scrapeProduct(page: Page, url: string): Promise<ScrapedPrice> {
     // Esperar a que el selector de precio este visible
@@ -162,11 +170,20 @@ abstract class BaseScraper implements StoreScraper {
     return null;
   }
 
-  /** Parsea texto de precio chileno: "$299.990" → 299990 */
+  /**
+   * Parsea texto de precio chileno: "$299.990" → 299990
+   *
+   * IMPORTANTE: No usar text.replace(/[^0-9]/g, '') directamente en todo el texto.
+   * Eso convierte "3 cuotas de $99.997" en "399997" (precio incorrecto).
+   * Primero extraer el patron de precio, luego limpiar.
+   */
   protected parsePrice(text: string | null): number | null {
     if (!text) return null;
-    // Remover todo excepto digitos
-    const cleaned = text.replace(/[^0-9]/g, '');
+    // Extraer el primer patron que parece un precio chileno: $123.456 o 123.456 o 123456
+    const priceMatch = text.match(/\$?\s*([\d.]+)/);
+    if (!priceMatch) return null;
+    // Remover puntos de miles (en CLP, "." es separador de miles, no decimales)
+    const cleaned = priceMatch[1].replace(/\./g, '');
     const value = parseInt(cleaned, 10);
     return isNaN(value) || value <= 0 ? null : value;
   }
@@ -198,6 +215,8 @@ class FalabellaScraper extends BaseScraper {
   readonly key = 'falabella';
   readonly pageTimeout = 20000; // Falabella es lenta
   readonly delayBetweenRequests = 3000;
+  readonly waitStrategy = 'networkidle' as const; // SPA React, necesita esperar API calls
+  // NO bloquear stylesheets — Falabella usa CSS-in-JS
 
   readonly selectors: StoreSelectors = {
     price: '[data-testid="price-0"] span, .prices-0 .copy10',
@@ -247,6 +266,8 @@ class PCFactoryScraper extends BaseScraper {
   readonly key = 'pcfactory';
   readonly pageTimeout = 10000; // PCFactory es mas rapida (menos JS)
   readonly delayBetweenRequests = 1500;
+  // PCFactory es server-rendered, se puede bloquear CSS para ahorrar recursos
+  readonly blockedResources = ['image', 'media', 'font', 'stylesheet'] as const;
 
   readonly selectors: StoreSelectors = {
     price: '#normal_price, .price-normal',
@@ -309,6 +330,7 @@ interface BrowserPoolConfig {
   maxBrowsers: number;       // default: 3
   maxPagesPerBrowser: number; // default: 5
   browserArgs: string[];
+  proxy?: { server: string; username?: string; password?: string };  // soporte de proxy
 }
 
 const defaultConfig: BrowserPoolConfig = {
@@ -331,28 +353,66 @@ const defaultConfig: BrowserPoolConfig = {
  * Pool de browsers Playwright para reutilizar instancias.
  * Limita la cantidad de browsers abiertos simultaneamente
  * para controlar el uso de RAM (~150-300MB por browser).
+ *
+ * IMPORTANTE: Usa semaforo para limitar paginas concurrentes a
+ * maxBrowsers * maxPagesPerBrowser. Sin esto, paginas ilimitadas = OOM.
  */
 class BrowserPool {
   private browsers: Browser[] = [];
   private config: BrowserPoolConfig;
+  private activePagesCount = 0;
+  private waitQueue: Array<() => void> = [];  // semaforo manual
 
   constructor(config: Partial<BrowserPoolConfig> = {}) {
     this.config = { ...defaultConfig, ...config };
   }
 
-  async acquirePage(): Promise<{ page: Page; context: BrowserContext; release: () => Promise<void> }> {
-    // Reutilizar browser existente o crear nuevo si hay espacio
-    let browser: Browser;
+  private get maxConcurrentPages(): number {
+    return this.config.maxBrowsers * this.config.maxPagesPerBrowser;
+  }
 
-    if (this.browsers.length < this.config.maxBrowsers) {
+  /** Esperar hasta que haya un slot disponible (semaforo) */
+  private async acquireSlot(): Promise<void> {
+    if (this.activePagesCount < this.maxConcurrentPages) {
+      this.activePagesCount++;
+      return;
+    }
+    // Esperar a que se libere un slot
+    return new Promise((resolve) => {
+      this.waitQueue.push(() => {
+        this.activePagesCount++;
+        resolve();
+      });
+    });
+  }
+
+  private releaseSlot(): void {
+    this.activePagesCount--;
+    const next = this.waitQueue.shift();
+    if (next) next();
+  }
+
+  async acquirePage(options?: {
+    blockResources?: ('image' | 'media' | 'font' | 'stylesheet')[];
+  }): Promise<{ page: Page; context: BrowserContext; release: () => Promise<void> }> {
+    // Semaforo: esperar slot disponible
+    await this.acquireSlot();
+
+    // Obtener browser (crear nuevo o reutilizar, con crash recovery)
+    let browser = this.getHealthyBrowser();
+
+    if (!browser) {
       browser = await chromium.launch({
         headless: true,
         args: this.config.browserArgs,
+        ...(this.config.proxy && { proxy: { server: this.config.proxy.server } }),
       });
       this.browsers.push(browser);
-    } else {
-      // Round-robin entre browsers existentes
-      browser = this.browsers[Math.floor(Math.random() * this.browsers.length)];
+
+      // Crash recovery: evictar browser muerto del pool
+      browser.on('disconnected', () => {
+        this.browsers = this.browsers.filter(b => b !== browser);
+      });
     }
 
     const context = await browser.newContext({
@@ -364,10 +424,14 @@ class BrowserPool {
 
     const page = await context.newPage();
 
-    // Bloquear recursos innecesarios para ahorrar RAM y tiempo
+    // Bloquear recursos — configurable por tienda
+    // NOTA: NO bloquear 'stylesheet' por defecto. SPAs (Falabella, Ripley)
+    // usan CSS-in-JS; sin stylesheets, elementos nunca se hacen visibles
+    // y waitForSelector({ state: 'visible' }) falla.
+    const blockedTypes = options?.blockResources ?? ['image', 'media', 'font'];
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
-      if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+      if (blockedTypes.includes(type as any)) {
         route.abort();
       } else {
         route.continue();
@@ -379,22 +443,41 @@ class BrowserPool {
       context,
       release: async () => {
         await context.close();
+        this.releaseSlot();
       },
     };
+  }
+
+  /** Obtener un browser conectado, o null si no hay / todos murieron */
+  private getHealthyBrowser(): Browser | null {
+    // Limpiar browsers desconectados
+    this.browsers = this.browsers.filter(b => b.isConnected());
+
+    if (this.browsers.length === 0) return null;
+    if (this.browsers.length < this.config.maxBrowsers) return null; // crear uno nuevo
+
+    // Round-robin entre browsers existentes
+    return this.browsers[Math.floor(Math.random() * this.browsers.length)];
   }
 
   async shutdown(): Promise<void> {
     await Promise.all(this.browsers.map(b => b.close()));
     this.browsers = [];
+    this.activePagesCount = 0;
+    this.waitQueue = [];
   }
 
+  /** User agents actualizables — mantener al dia con versiones reales */
   private getRandomUserAgent(): string {
     const agents = [
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0',
     ];
+    // TODO: considerar cargar UAs desde config o archivo externo para actualizar sin redeploy
     return agents[Math.floor(Math.random() * agents.length)];
   }
 }
@@ -424,12 +507,15 @@ async function scrapeProductUrl(params: ScrapeProductUrlParams): Promise<ScrapeR
   const startTime = Date.now();
   const scraper = getScraper(params.scraperKey);
 
-  const { page, release } = await browserPool.acquirePage();
+  // Usar blockedResources del scraper (NO bloquear stylesheets por defecto)
+  const { page, release } = await browserPool.acquirePage({
+    blockResources: scraper.blockedResources,
+  });
 
   try {
-    // 1. Navegar
+    // 1. Navegar (usar waitStrategy del scraper — SPAs necesitan 'networkidle')
     await page.goto(params.url, {
-      waitUntil: 'domcontentloaded',
+      waitUntil: scraper.waitStrategy,
       timeout: scraper.pageTimeout,
     });
 
@@ -445,30 +531,46 @@ async function scrapeProductUrl(params: ScrapeProductUrlParams): Promise<ScrapeR
       };
     }
 
-    // 3. Extraer datos
+    // 3. Extraer datos (aplicar CSS overrides si existen)
+    // TODO: merge cssOverrides sobre scraper.selectors antes de llamar scrapeProduct
     const data = await scraper.scrapeProduct(page, params.url);
 
     // 4. Validar datos
     validateScrapedPrice(data);
 
-    // 5. Guardar en DB
-    await db.insert(prices).values({
-      productUrlId: params.productUrlId,
-      price: data.price,
-      offerPrice: data.offerPrice,
-      isAvailable: data.isAvailable,
-      currency: data.currency,
-    });
+    // 5. Guardar en DB — TRANSACCION para atomicidad
+    await db.transaction(async (tx) => {
+      // 5a. Detectar anomalias de precio (>50% cambio)
+      if (params.lastPrice && data.price) {
+        const changePct = Math.abs(data.price - params.lastPrice) / params.lastPrice * 100;
+        if (changePct > 50) {
+          await tx.insert(priceAnomalies).values({
+            productUrlId: params.productUrlId,
+            previousPrice: params.lastPrice,
+            newPrice: data.price,
+            changePct,
+          });
+        }
+      }
 
-    // 6. Actualizar cache en product_urls
-    await db.update(productUrls)
-      .set({
-        lastScrapedAt: new Date(),
-        lastPrice: data.price,
-        lastOfferPrice: data.offerPrice,
-        updatedAt: new Date(),
-      })
-      .where(eq(productUrls.id, params.productUrlId));
+      // 5b. Insertar precio en historial
+      await tx.insert(prices).values({
+        productUrlId: params.productUrlId,
+        price: data.price,
+        offerPrice: data.offerPrice,
+        isAvailable: data.isAvailable,
+        currency: data.currency,
+      });
+
+      // 5c. Actualizar cache en product_urls
+      await tx.update(productUrls)
+        .set({
+          lastScrapedAt: new Date(),
+          lastPrice: data.price,
+          lastOfferPrice: data.offerPrice,
+        })
+        .where(eq(productUrls.id, params.productUrlId));
+    });
 
     return {
       success: true,
@@ -511,31 +613,40 @@ function validateScrapedPrice(data: ScrapedPrice): void {
 
 ## Manejo de Errores y Reintentos
 
+### Errores por tipo (logica interna del handler)
+
 ```
-Error detectado
+Error detectado dentro de processStoreScrape()
     │
-    ├── CAPTCHA → Marcar URL, reintentar en proximo ciclo con delay mayor
+    ├── CAPTCHA → Marcar URL para delay mayor, continuar con siguientes URLs
+    │              NO lanzar excepcion (no es retryable a nivel de job)
     │
-    ├── Timeout → Reintentar 1 vez con timeout extendido
+    ├── Timeout → Continuar con siguiente URL, incrementar errorCount
     │
     ├── 404 / Producto no existe → Marcar product_url como is_active=false
+    │                               NO lanzar excepcion (accion permanente)
     │
-    ├── Precio invalido → Loguear warning, no guardar, reintentar
+    ├── Precio invalido → Loguear warning, no guardar, continuar
     │
-    ├── Selector no encontrado → Loguear error (puede indicar cambio de HTML)
+    ├── Selector no encontrado → Loguear error (posible cambio de HTML), continuar
     │
-    └── Error de red → Reintentar hasta 2 veces con backoff
+    └── Error de red → Continuar con siguiente URL
 ```
 
-Los reintentos se manejan a nivel de BullMQ (ver `05-scheduling-jobs.md`):
+> **IMPORTANTE**: El handler de cada URL NO lanza excepciones para errores por-URL.
+> Solo incrementa `errorCount`. BullMQ reintenta el JOB completo solo si el handler
+> lanza una excepcion (error critico: DB caida, browser crash, etc.).
+> Esto evita reintentar un job de 1000 URLs porque 1 URL dio 404.
+
+### Reintentos a nivel de BullMQ (errores criticos)
 
 ```typescript
-// Configuracion de reintentos del job
+// Solo para errores que afectan TODO el job (no URLs individuales)
 {
-  attempts: 3,
+  attempts: 2,
   backoff: {
     type: 'exponential',
-    delay: 5000, // 5s, 10s, 20s
+    delay: 30000, // 30s, 60s
   },
 }
 ```
@@ -550,7 +661,7 @@ Medidas incluidas para evitar bloqueos (sin ser agresivo):
 4. **Locale chileno**: `es-CL`, timezone `America/Santiago`
 5. **Viewport realista**: 1280x720
 6. **No paralelismo excesivo**: max 3 browsers, scraping secuencial por dominio
-7. **Respetar robots.txt**: verificar antes de scrapear (primera vez por dominio)
+7. **Respetar robots.txt**: usar libreria `robots-parser`, cachear resultado en Redis por dominio (TTL 24h). Verificar antes del primer scrape de cada dominio
 
 ### Que NO hacer (evitar ban):
 - No scrapear mas de 1-2 veces al dia por producto

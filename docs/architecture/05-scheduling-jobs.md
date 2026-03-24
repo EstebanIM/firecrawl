@@ -83,32 +83,58 @@ export async function enqueueAllStores(triggeredBy: 'cron' | 'manual') {
     .from(stores)
     .where(eq(stores.isActive, true));
 
-  for (const store of activeStores) {
-    // Crear registro en scrape_jobs
-    const [job] = await db.insert(scrapeJobs).values({
-      storeId: store.id,
-      status: 'pending',
-      triggeredBy,
-    }).returning();
+  // OVERLAP GUARD: verificar que no haya jobs del ciclo anterior aun corriendo
+  const runningJobs = await db.select({ id: scrapeJobs.id })
+    .from(scrapeJobs)
+    .where(eq(scrapeJobs.status, 'running'))
+    .limit(1);
 
-    // Encolar job en BullMQ
+  if (runningJobs.length > 0 && triggeredBy === 'cron') {
+    console.warn('[Scheduler] Ciclo anterior aun en ejecucion. Saltando este ciclo.');
+    return;
+  }
+
+  // ATOMICIDAD: Insertar todos los registros DB en una transaccion,
+  // luego encolar a BullMQ. Si falla a mitad, no quedan stores parciales.
+  const cycleDate = new Date().toISOString().slice(0, 10).replace(/-/g, ''); // YYYYMMDD
+  const cyclePeriod = new Date().getHours() < 12 ? 'AM' : 'PM';
+
+  const jobRecords = await db.transaction(async (tx) => {
+    return Promise.all(activeStores.map(store =>
+      tx.insert(scrapeJobs).values({
+        storeId: store.id,
+        status: 'pending',
+        triggeredBy,
+      }).returning().then(rows => ({ store, dbJob: rows[0] }))
+    ));
+  });
+
+  // Encolar a BullMQ despues de que la transaccion DB complicó exitosamente
+  for (const { store, dbJob } of jobRecords) {
+    // DEDUPLICACION: jobId unico por ciclo. Si el ciclo tarda >12h y el
+    // siguiente cron dispara, el job existente no se duplica.
+    const jobId = `store-${store.slug}-${cycleDate}-${cyclePeriod}`;
+
     await scrapeQueue.add(
       `store-${store.slug}`,
       {
         type: 'store-scrape',
         storeId: store.id,
         scraperKey: store.scraperKey,
-        scrapeJobId: job.id,
+        scrapeJobId: dbJob.id,
       },
       {
+        jobId,                                // deduplicacion por ciclo
         priority: getStorePriority(store.slug),
         attempts: 2,
         backoff: { type: 'exponential', delay: 30000 },
-        removeOnComplete: { age: 86400 },   // limpiar despues de 24h
-        removeOnFail: { age: 604800 },       // mantener fallos 7 dias
+        removeOnComplete: { age: 86400 },     // limpiar despues de 24h
+        removeOnFail: { age: 604800 },        // mantener fallos 7 dias
       },
     );
   }
+
+  console.log(`[Scheduler] ${jobRecords.length} tiendas encoladas (ciclo ${cycleDate}-${cyclePeriod})`);
 }
 
 /** Prioridad: menor numero = mayor prioridad */
@@ -178,10 +204,8 @@ export function startWorker() {
         maxRetriesPerRequest: null,
       }),
       concurrency: 3,  // max 3 jobs simultaneos (= max 3 browsers)
-      limiter: {
-        max: 10,        // max 10 jobs por minuto (rate limit global)
-        duration: 60000,
-      },
+      // NOTA: No usar BullMQ limiter global con 10-20 tiendas — no aporta nada
+      // con concurrency:3. El rate limiting real es delayBetweenRequests por URL.
     },
   );
 
@@ -193,15 +217,22 @@ export function startWorker() {
     console.error(`[Worker] Job ${job?.id} fallo:`, err.message);
   });
 
-  // Graceful shutdown
+  // Graceful shutdown — cerrar worker, queue Y conexion Redis
+  const workerRedis = (worker as any).connection; // acceso a la conexion interna
   process.on('SIGTERM', async () => {
-    console.log('[Worker] Cerrando...');
-    await worker.close();
-    await browserPool.shutdown();
+    console.log('[Worker] Cerrando gracefully...');
+    await worker.close();          // esperar jobs en vuelo
+    await scrapeQueue.close();     // cerrar queue (producer)
+    await browserPool.shutdown();  // cerrar browsers Playwright
+    workerRedis?.disconnect();     // cerrar conexion Redis del worker
+    process.exit(0);
   });
 
   return worker;
 }
+
+// Timeout en ms para una URL individual (evita que un hang bloquee todo el job)
+const URL_SCRAPE_TIMEOUT_MS = 45_000; // 45 segundos
 
 async function processStoreScrape(job: Job) {
   const { storeId, scraperKey, scrapeJobId } = job.data;
@@ -223,16 +254,25 @@ async function processStoreScrape(job: Job) {
   let successCount = 0;
   let errorCount = 0;
   const errors: Array<{ url: string; error: string }> = [];
+  // Umbral de progreso: reportar cada 10% del total (funciona para cualquier tamano de tienda)
+  const progressStep = Math.max(1, Math.ceil(urls.length / 10));
 
   // Procesar URLs secuencialmente por tienda (respetar rate limiting)
   for (const pu of urls) {
     try {
-      const result = await scrapeProductUrl({
-        productUrlId: pu.id,
-        url: pu.url,
-        scraperKey,
-        cssOverrides: pu.cssSelectors,
-      });
+      // TIMEOUT POR URL: si scrapeProductUrl se cuelga, no bloquea el job entero
+      const result = await Promise.race([
+        scrapeProductUrl({
+          productUrlId: pu.id,
+          url: pu.url,
+          scraperKey,
+          cssOverrides: pu.cssSelectors,
+        }),
+        new Promise<{ success: false; error: string }>((_, reject) =>
+          setTimeout(() => reject(new Error(`Timeout: URL no respondio en ${URL_SCRAPE_TIMEOUT_MS / 1000}s`)),
+            URL_SCRAPE_TIMEOUT_MS)
+        ),
+      ]);
 
       if (result.success) {
         successCount++;
@@ -251,11 +291,10 @@ async function processStoreScrape(job: Job) {
     // Delay entre requests (respetar rate limiting de la tienda)
     await delay(scraper.delayBetweenRequests);
 
-    // Actualizar progreso periodicamente
-    if ((successCount + errorCount) % 50 === 0) {
-      await job.updateProgress(
-        Math.round(((successCount + errorCount) / urls.length) * 100)
-      );
+    // Reportar progreso cada 10% del total (funciona con 10 o 2000 URLs)
+    const processed = successCount + errorCount;
+    if (processed % progressStep === 0) {
+      await job.updateProgress(Math.round((processed / urls.length) * 100));
     }
   }
 
@@ -272,9 +311,21 @@ async function processStoreScrape(job: Job) {
     })
     .where(eq(scrapeJobs.id, scrapeJobId));
 
-  // Refrescar vistas materializadas
-  await db.execute(sql`REFRESH MATERIALIZED VIEW CONCURRENTLY mv_current_prices`);
-  await db.execute(sql`REFRESH MATERIALIZED VIEW CONCURRENTLY mv_best_prices`);
+  // REFRESH DEBOUNCED: solo refrescar vistas materializadas cuando NO quedan
+  // mas jobs 'running' del mismo ciclo. Evita 3 refreshes concurrentes con
+  // lock contention en PG de 512MB cuando varias tiendas terminan juntas.
+  // NOTA: REFRESH CONCURRENTLY requiere un UNIQUE index en la vista.
+  const stillRunning = await db.select({ id: scrapeJobs.id })
+    .from(scrapeJobs)
+    .where(eq(scrapeJobs.status, 'running'))
+    .limit(1);
+
+  if (stillRunning.length === 0) {
+    console.log('[Worker] Ultimo job del ciclo. Refrescando vistas materializadas...');
+    await db.execute(sql`REFRESH MATERIALIZED VIEW CONCURRENTLY mv_current_prices`);
+    await db.execute(sql`REFRESH MATERIALIZED VIEW CONCURRENTLY mv_best_prices`);
+    console.log('[Worker] Vistas materializadas actualizadas.');
+  }
 }
 
 async function processSingleScrape(job: Job) {
@@ -293,8 +344,10 @@ function delay(ms: number): Promise<void> {
 1. 6:00 AM → node-cron trigger
     │
 2.  └─▶ enqueueAllStores('cron')
-         ├─ INSERT scrape_jobs (status: 'pending') por cada tienda
-         └─ scrapeQueue.add() por cada tienda (con prioridad)
+         ├─ OVERLAP GUARD: si hay jobs 'running' → saltar ciclo
+         ├─ DB transaction: INSERT scrape_jobs (status: 'pending') por cada tienda
+         └─ BullMQ: scrapeQueue.add() con jobId unico (store-{slug}-YYYYMMDD-AM/PM)
+              └─ Si el jobId ya existe en BullMQ → se ignora (deduplicacion)
     │
 3.  └─▶ Worker picks up job (concurrency: 3)
          │
@@ -303,21 +356,24 @@ function delay(ms: number): Promise<void> {
               ├─ UPDATE scrape_jobs SET status = 'running'
               │
 5.            └─▶ FOR EACH url (secuencial, con delays):
-                   ├─ browserPool.acquirePage()
-                   ├─ page.goto(url)
-                   ├─ scraper.checkPageHealth(page)
-                   ├─ scraper.scrapeProduct(page) → ScrapedPrice
-                   ├─ validateScrapedPrice(data)
-                   ├─ INSERT prices (historial)
-                   ├─ UPDATE product_urls (cache)
-                   ├─ release page
-                   └─ delay(delayBetweenRequests)
+                   ├─ Promise.race([scrapeProductUrl(), timeout(45s)])
+                   │   ├─ browserPool.acquirePage()
+                   │   ├─ page.goto(url)
+                   │   ├─ scraper.checkPageHealth(page)
+                   │   ├─ scraper.scrapeProduct(page) → ScrapedPrice
+                   │   ├─ validateScrapedPrice(data)
+                   │   ├─ db.transaction: INSERT prices + UPDATE product_urls
+                   │   └─ release page
+                   ├─ delay(delayBetweenRequests)
+                   └─ updateProgress cada 10% del total de URLs
               │
 6.            └─▶ UPDATE scrape_jobs SET status = 'completed'
-              └─▶ REFRESH MATERIALIZED VIEW mv_current_prices
-              └─▶ REFRESH MATERIALIZED VIEW mv_best_prices
+              └─▶ SI no hay mas jobs 'running':
+                   ├─ REFRESH MATERIALIZED VIEW CONCURRENTLY mv_current_prices
+                   └─ REFRESH MATERIALIZED VIEW CONCURRENTLY mv_best_prices
     │
-7. ~7:00 AM → Todos los jobs completados (estimado ~45-60 min para 10-20 tiendas)
+7. ~7:00 AM → Todos los jobs completados, vistas materializadas actualizadas
+              (estimado ~45-60 min para 10-20 tiendas con 200-500 URLs cada una)
 ```
 
 ## Estimacion de Tiempos

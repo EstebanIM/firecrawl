@@ -182,6 +182,7 @@ CREATE TABLE products (
     ean           VARCHAR(20),   -- codigo de barras para matching cross-store
     metadata      JSONB NOT NULL DEFAULT '{}',  -- specs: RAM, storage, color, etc.
     search_vector TSVECTOR,
+    is_active     BOOLEAN NOT NULL DEFAULT true,  -- soft delete (no CASCADE delete, preserva historial)
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -198,19 +199,25 @@ CREATE INDEX idx_products_slug ON products(slug);
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE INDEX idx_products_name_trgm ON products USING GIN(name gin_trgm_ops);
 
--- Trigger para mantener search_vector actualizado
+-- Trigger para mantener search_vector actualizado (incluye brand name via JOIN)
 CREATE OR REPLACE FUNCTION products_search_vector_update() RETURNS trigger AS $$
+DECLARE
+    brand_name TEXT;
 BEGIN
+    -- Obtener nombre de marca para incluir en el vector de busqueda
+    SELECT b.name INTO brand_name FROM brands b WHERE b.id = NEW.brand_id;
+
     NEW.search_vector :=
         setweight(to_tsvector('spanish', COALESCE(NEW.name, '')), 'A') ||
-        setweight(to_tsvector('spanish', COALESCE(NEW.description, '')), 'C') ||
-        setweight(to_tsvector('spanish', COALESCE(NEW.sku, '')), 'B');
+        setweight(to_tsvector('spanish', COALESCE(brand_name, '')), 'A') ||
+        setweight(to_tsvector('spanish', COALESCE(NEW.sku, '')), 'B') ||
+        setweight(to_tsvector('spanish', COALESCE(NEW.description, '')), 'C');
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trg_products_search_vector
-    BEFORE INSERT OR UPDATE OF name, description, sku
+    BEFORE INSERT OR UPDATE OF name, description, sku, brand_id
     ON products
     FOR EACH ROW
     EXECUTE FUNCTION products_search_vector_update();
@@ -232,37 +239,46 @@ CREATE TABLE product_urls (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    UNIQUE(product_id, store_id)      -- un producto por tienda
+    UNIQUE(url)                       -- una URL unica por registro (un producto puede tener multiples URLs en la misma tienda: marketplace sellers, variantes, URLs migradas)
 );
 
 CREATE INDEX idx_product_urls_store ON product_urls(store_id);
 CREATE INDEX idx_product_urls_product ON product_urls(product_id);
 CREATE INDEX idx_product_urls_active ON product_urls(is_active) WHERE is_active = true;
 CREATE INDEX idx_product_urls_last_scraped ON product_urls(last_scraped_at);
+CREATE INDEX idx_product_urls_url ON product_urls(url);  -- lookup por URL para deduplicacion
 ```
 
-### Tabla: prices (historial - tabla mas grande)
+### Tabla: prices (historial - tabla mas grande, PARTICIONADA)
+
+Con 12 tiendas x 5,000 productos x 2 scrapes/dia = ~120,000 rows/dia, ~3.6M/mes.
+**Particionamiento mensual es OBLIGATORIO** desde dia 1 para:
+- Retencion eficiente (`DROP PARTITION` instantaneo vs DELETE lento)
+- Partition pruning en queries con rango de fechas
+- VACUUM eficiente por particion
 
 ```sql
 CREATE TABLE prices (
-    id              BIGSERIAL PRIMARY KEY,
+    id              BIGSERIAL,
     product_url_id  INTEGER NOT NULL REFERENCES product_urls(id) ON DELETE CASCADE,
-    price           INTEGER NOT NULL,            -- precio normal en CLP (sin decimales)
-    offer_price     INTEGER,                     -- precio oferta/descuento
+    price           INTEGER NOT NULL CHECK (price > 0),  -- precio normal en CLP (sin decimales)
+    offer_price     INTEGER CHECK (offer_price > 0),     -- precio oferta/descuento
     is_available    BOOLEAN NOT NULL DEFAULT true,
     currency        VARCHAR(3) NOT NULL DEFAULT 'CLP',
-    scraped_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+    scraped_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (id, scraped_at)  -- PK incluye partition key
+) PARTITION BY RANGE (scraped_at);
 
--- Indice principal: buscar precios de un producto en rango de fechas
+-- Crear particiones mensuales (automatizar con pg_partman o cron)
+CREATE TABLE prices_2026_03 PARTITION OF prices
+    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+CREATE TABLE prices_2026_04 PARTITION OF prices
+    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+-- ... crear particiones futuras con script o pg_partman
+
+-- Indices (se crean automaticamente en cada particion)
 CREATE INDEX idx_prices_product_url_date ON prices(product_url_id, scraped_at DESC);
-
--- Particionamiento por mes (opcional, recomendado si crece mucho)
--- CREATE TABLE prices (
---     ...
--- ) PARTITION BY RANGE (scraped_at);
--- CREATE TABLE prices_2026_03 PARTITION OF prices
---     FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+CREATE INDEX idx_prices_scraped_at ON prices(scraped_at);  -- para queries de retencion
 ```
 
 ### Tabla: scrape_jobs
@@ -289,6 +305,46 @@ CREATE TABLE scrape_jobs (
 CREATE INDEX idx_scrape_jobs_status ON scrape_jobs(status);
 CREATE INDEX idx_scrape_jobs_store ON scrape_jobs(store_id);
 CREATE INDEX idx_scrape_jobs_created ON scrape_jobs(created_at DESC);
+```
+
+### Tabla: price_anomalies (deteccion de cambios sospechosos)
+
+```sql
+CREATE TABLE price_anomalies (
+    id              SERIAL PRIMARY KEY,
+    product_url_id  INTEGER NOT NULL REFERENCES product_urls(id) ON DELETE CASCADE,
+    previous_price  INTEGER NOT NULL,
+    new_price       INTEGER NOT NULL,
+    change_pct      NUMERIC(5,2) NOT NULL,  -- porcentaje de cambio
+    resolved        BOOLEAN NOT NULL DEFAULT false,
+    resolved_at     TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_price_anomalies_unresolved ON price_anomalies(resolved) WHERE resolved = false;
+```
+
+> **Logica**: Antes de guardar un precio, comparar con `product_urls.last_price`.
+> Si el cambio es >50% en cualquier direccion, insertar en `price_anomalies` y
+> guardar el precio igualmente (no bloquear), pero marcar para revision.
+
+### Trigger: updated_at automatico
+
+```sql
+-- Trigger generico para auto-actualizar updated_at en cualquier tabla
+CREATE OR REPLACE FUNCTION update_updated_at() RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_products_updated_at
+    BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER trg_product_urls_updated_at
+    BEFORE UPDATE ON product_urls FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER trg_stores_updated_at
+    BEFORE UPDATE ON stores FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 ```
 
 ## Vistas Materializadas
@@ -347,6 +403,26 @@ CREATE UNIQUE INDEX idx_mv_best_prices_product ON mv_best_prices(product_id);
 -- Refrescar despues de mv_current_prices:
 -- REFRESH MATERIALIZED VIEW CONCURRENTLY mv_best_prices;
 ```
+
+### Estrategia de Refresh
+
+> **IMPORTANTE**: NO refrescar vistas por cada tienda que termina su scraping.
+> Si 3 tiendas terminan casi al mismo tiempo, 3 refreshes concurrentes causan
+> lock contention en PostgreSQL (especialmente con 512MB de RAM).
+>
+> **Estrategia**: Un unico job de refresh que corre despues de que TODOS los
+> stores del ciclo terminan, usando advisory locks para prevenir ejecucion concurrente.
+
+```sql
+-- Usar advisory lock para serializar refreshes
+SELECT pg_try_advisory_lock(42001);  -- retorna false si otro refresh esta corriendo
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_current_prices;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_best_prices;
+SELECT pg_advisory_unlock(42001);
+```
+
+> **Requisito**: `REFRESH CONCURRENTLY` requiere un UNIQUE INDEX en la vista.
+> Los indices `idx_mv_current_prices_pu` y `idx_mv_best_prices_product` ya cumplen esto.
 
 ## Queries Frecuentes
 
@@ -432,18 +508,39 @@ LIMIT 50;
 | 0-30 dias | Todos los data points | Mantener tal cual |
 | 30-180 dias | 1 por dia (min del dia) | Agregar con cron job |
 | 180+ dias | 1 por semana | Agregar con cron job |
+| 12+ meses | Eliminar particion | `DROP TABLE prices_YYYY_MM` |
+
+### Retencion con particionamiento (recomendado)
+
+Con particionamiento mensual, la retencion de datos viejos es instantanea:
 
 ```sql
--- Job de agregacion mensual (eliminar duplicados intra-dia antiguos)
-DELETE FROM prices
-WHERE scraped_at < NOW() - INTERVAL '30 days'
-  AND id NOT IN (
-      SELECT DISTINCT ON (product_url_id, DATE(scraped_at))
-             id
-      FROM prices
-      WHERE scraped_at < NOW() - INTERVAL '30 days'
-      ORDER BY product_url_id, DATE(scraped_at), scraped_at ASC
-  );
+-- Eliminar datos de hace 12+ meses (instantaneo, sin locks)
+DROP TABLE IF EXISTS prices_2025_03;
+```
+
+### Agregacion intra-dia (para el rango 30-180 dias)
+
+> **IMPORTANTE**: NO usar `NOT IN` con subquery en tablas grandes — es catastrofico.
+> Procesar en batches con CTEs y LIMIT.
+
+```sql
+-- Procesar en batches de 10,000 rows por ejecucion
+WITH keepers AS (
+  SELECT DISTINCT ON (product_url_id, DATE(scraped_at)) id
+  FROM prices
+  WHERE scraped_at BETWEEN (NOW() - INTERVAL '180 days') AND (NOW() - INTERVAL '30 days')
+  ORDER BY product_url_id, DATE(scraped_at), scraped_at ASC
+),
+to_delete AS (
+  SELECT p.id FROM prices p
+  WHERE p.scraped_at BETWEEN (NOW() - INTERVAL '180 days') AND (NOW() - INTERVAL '30 days')
+    AND p.id NOT IN (SELECT id FROM keepers)
+  LIMIT 10000
+)
+DELETE FROM prices WHERE id IN (SELECT id FROM to_delete);
+
+-- Ejecutar multiples veces hasta que no queden rows por eliminar
 ```
 
 ## Migraciones

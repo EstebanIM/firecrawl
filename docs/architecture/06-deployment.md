@@ -61,6 +61,23 @@ pnpm worker
 # docker-compose.yml
 
 services:
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   app:
     build:
       context: .
@@ -68,23 +85,29 @@ services:
     environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://preciochile:${POSTGRES_PASSWORD}@postgres:5432/preciochile
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       ADMIN_API_KEY: ${ADMIN_API_KEY}
       PORT: 3000
-    ports:
-      - "${PORT:-3000}:3000"
+    # No exponer el puerto al host — Caddy actua como reverse proxy
+    expose:
+      - "3000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
-    # Limites de recursos
+    # MEMORIA: 3 browsers Playwright (450-900MB) + Next.js SSR (300-500MB)
+    # = min ~750MB bajo carga. 2G da margen para SSR concurrente + OS overhead.
     deploy:
       resources:
         limits:
-          memory: 1.5G
+          memory: 2G
           cpus: '2.0'
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   postgres:
     image: postgres:16-alpine
@@ -105,14 +128,24 @@ services:
         limits:
           memory: 512M
           cpus: '0.5'
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   redis:
     image: redis:7-alpine
-    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru --save 60 1000
+    # Redis con password obligatorio en produccion
+    command: >
+      redis-server
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --requirepass ${REDIS_PASSWORD}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -122,13 +155,42 @@ services:
         limits:
           memory: 256M
           cpus: '0.25'
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   postgres_data:
   redis_data:
+  caddy_data:
+  caddy_config:
 ```
 
+### Caddyfile
+
+```caddyfile
+# Caddyfile
+tu-dominio.cl {
+    reverse_proxy app:3000
+}
+```
+
+Caddy gestiona automaticamente los certificados TLS via Let's Encrypt.
+Sin configuracion adicional: HTTP → HTTPS redirect incluido.
+
 ## Dockerfile
+
+> **CRITICO**: `CMD ["node", "server.js"]` requiere `output: "standalone"` en `next.config.ts`.
+> Sin esto, `pnpm build` no genera `server.js` y el contenedor falla al iniciar.
+>
+> ```typescript
+> // next.config.ts — OBLIGATORIO para el Dockerfile
+> const nextConfig = {
+>   output: 'standalone',
+> };
+> export default nextConfig;
+> ```
 
 ```dockerfile
 # Dockerfile
@@ -163,23 +225,76 @@ RUN npx playwright install chromium
 FROM deps AS build
 COPY . .
 RUN pnpm build
+# "output: standalone" genera .next/standalone/server.js con todas las dependencias
 
 # Production
 FROM base AS runner
 ENV NODE_ENV=production
 
 COPY --from=deps /root/.cache/ms-playwright /root/.cache/ms-playwright
-COPY --from=deps /app/node_modules ./node_modules
-COPY --from=build /app/.next ./.next
+# standalone incluye node_modules minificado — no copiar node_modules completo
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
 COPY --from=build /app/public ./public
-COPY --from=build /app/package.json ./
 COPY --from=build /app/drizzle ./drizzle
+# Script de startup que ejecuta migraciones + inicia servidor
+COPY scripts/start.sh ./start.sh
+RUN chmod +x ./start.sh
 
 EXPOSE 3000
 
-# Ejecutar Next.js + Worker en el mismo proceso
-CMD ["node", "server.js"]
+# start.sh: ejecuta migraciones primero, luego inicia el servidor
+CMD ["./start.sh"]
 ```
+
+### Script de Startup (`scripts/start.sh`)
+
+```bash
+#!/bin/sh
+set -e
+
+echo "[Startup] Ejecutando migraciones de DB..."
+node -e "
+const { drizzle } = require('drizzle-orm/node-postgres');
+const { migrate } = require('drizzle-orm/node-postgres/migrator');
+const { Pool } = require('pg');
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const db = drizzle(pool);
+migrate(db, { migrationsFolder: './drizzle' }).then(() => {
+  console.log('[Startup] Migraciones completadas.');
+  pool.end();
+}).catch(err => {
+  console.error('[Startup] Error en migraciones:', err);
+  process.exit(1);
+});
+"
+
+echo "[Startup] Iniciando servidor Next.js..."
+exec node server.js
+```
+
+### Worker Startup via `instrumentation.ts`
+
+El worker y scheduler se inician usando el hook de Next.js `instrumentation.ts`,
+que se ejecuta una vez cuando el servidor arranca (solo en produccion / en el servidor):
+
+```typescript
+// src/instrumentation.ts
+export async function register() {
+  // Solo en el servidor (no en el edge runtime)
+  if (process.env.NEXT_RUNTIME === 'nodejs') {
+    const { startWorker } = await import('./lib/jobs/worker');
+    const { startScheduler } = await import('./lib/jobs/scheduler');
+
+    startWorker();
+    startScheduler();
+
+    console.log('[Instrumentation] Worker y Scheduler iniciados.');
+  }
+}
+```
+
+Esto permite que Next.js + Worker corran en el mismo proceso sin un custom `server.ts`.
 
 ## Variables de Entorno
 
@@ -190,8 +305,9 @@ CMD ["node", "server.js"]
 DATABASE_URL=postgresql://preciochile:CHANGE_ME_STRONG_PASSWORD@postgres:5432/preciochile
 POSTGRES_PASSWORD=CHANGE_ME_STRONG_PASSWORD
 
-# === Redis ===
-REDIS_URL=redis://redis:6379
+# === Redis (password OBLIGATORIO en produccion) ===
+REDIS_PASSWORD=CHANGE_ME_REDIS_PASSWORD
+REDIS_URL=redis://:CHANGE_ME_REDIS_PASSWORD@redis:6379
 
 # === App ===
 NODE_ENV=production
@@ -199,16 +315,16 @@ PORT=3000
 NEXT_PUBLIC_APP_URL=https://tu-dominio.cl
 
 # === Admin ===
-ADMIN_API_KEY=CHANGE_ME_RANDOM_STRING
+ADMIN_API_KEY=CHANGE_ME_RANDOM_STRING_MIN_32_CHARS
 
 # === Scraping ===
 MAX_BROWSERS=3              # max browsers simultaneos
 SCRAPE_CRON="0 6,18 * * *"  # horario de scraping (default: 6AM y 6PM)
 REQUEST_DELAY_MS=2000        # delay entre requests (ms)
 
-# === Opcional ===
-# PROXY_URL=http://user:pass@proxy:port   # proxy para scraping
-# SENTRY_DSN=https://...                   # error tracking
+# === Observabilidad ===
+# SENTRY_DSN=https://...@sentry.io/...    # error tracking (ver doc 00)
+LOG_LEVEL=info                            # pino log level
 ```
 
 ## Uso de RAM Estimado
