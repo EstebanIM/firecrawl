@@ -18,12 +18,38 @@ ver el historial de precios, y encontrar las mejores ofertas.
 | Base de datos | PostgreSQL 16 | Full-text search nativo, JSONB, vistas materializadas, robusto |
 | Cache + Colas | Redis 7 | Cache de queries, BullMQ para jobs de scraping |
 | Cola de jobs | BullMQ | Integra con Redis, reintentos, prioridades, dashboard |
-| Scraping | Playwright | Maneja JS-heavy sites (Falabella, Ripley), headless Chrome |
+| Scraping | Firecrawl (`@mendable/firecrawl-js`) | Renderiza JS-heavy sites via self-hosted Firecrawl; devuelve HTML para parsear con CSS selectors |
+| HTML parsing | cheerio | Extraccion determinista de precios con CSS selectors (sin LLM, $0 por scrape) |
 | ORM | Drizzle ORM | Type-safe, migraciones, lightweight, SQL-first |
 | Estilos | Tailwind CSS 4 | Utility-first, rapido de prototipar |
 | Charts | Recharts | Graficos de historial de precios, basado en React |
+| Logging | pino | Logging estructurado JSON, bajo overhead, compatible con Next.js |
+| Error tracking | Sentry | Captura excepciones en produccion, alertas, stack traces |
 | Runtime | Node.js 22 LTS | Soporte nativo de TypeScript (--experimental-strip-types) |
 | Containerizacion | Docker + Docker Compose | Reproducible en desarrollo y produccion |
+| Reverse proxy | Caddy 2 | HTTPS automatico via Let's Encrypt, cero configuracion TLS |
+
+### Connection Pooling
+
+Drizzle ORM usa `pg` (node-postgres) directamente. En produccion, configurar pool
+limitado para evitar saturar PostgreSQL en un VPS de 512MB:
+
+```typescript
+// src/lib/db/index.ts
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,           // max conexiones simultaneas (default: 10 — ok para 1 VPS)
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 2_000,
+});
+
+export const db = drizzle(pool);
+```
+
+Para cargas mayores (futuro), considerar PgBouncer como proxy de pooling externo.
 
 ## Diagrama de Componentes
 
@@ -129,7 +155,7 @@ Retorna productos con: mejor precio actual, # tiendas, imagen
 Usuario hace click en producto
     │
     ▼
-GET /api/products/[id] → Precios por tienda + historial
+GET /api/products/[slug] → Precios por tienda + historial
     │
     ▼
 Render: tabla comparativa + grafico de historial (Recharts)
@@ -149,7 +175,7 @@ Render: tabla comparativa + grafico de historial (Recharts)
 | AbcDin | Departamental | abcdin.cl | Moderado | Media |
 | Easy | Home improvement | easy.cl | Si | Media |
 | Mercado Libre | Marketplace | mercadolibre.cl | Si | Media |
-| Linio | Marketplace | linio.cl | Si | Baja |
+| ~~Linio~~ | ~~Marketplace~~ | linio.cl | — | **CERRADO** — Linio.cl ceso operaciones en Chile. No incluir. |
 | Microplay | Tecnologia/Gaming | microplay.cl | Moderado | Baja |
 | SP Digital | Tecnologia | spdigital.cl | Bajo | Media |
 | Knasta referencia | Comparador | knasta.cl | Si | Referencia |
@@ -169,17 +195,23 @@ Render: tabla comparativa + grafico de historial (Recharts)
 
 ### Por que BullMQ y no un cron simple?
 - Reintentos automaticos con backoff exponencial
-- Concurrencia controlada (max N browsers simultaneos)
+- Concurrencia controlada (max N jobs simultaneos)
 - Dashboard visual para monitorear jobs
 - Prioridades: productos populares primero
 - Rate limiting por dominio integrado
 
+### Por que Firecrawl y no Playwright directo?
+- Firecrawl ya maneja browser pool, crash recovery, stealth mode, y JS rendering
+- El worker PrecioChile hace una llamada HTTP a Firecrawl self-hosted y recibe HTML limpio
+- Sin dependencias de Playwright en el contenedor de la app (imagen Docker mucho mas pequena)
+- Self-hosted = $0 por scrape, igual que Playwright pero con mucho menos codigo a mantener
+
 ### Por que CSS Selectors y no LLM extraction?
 - Precision: CSS selectors son 100% deterministas para campos estructurados (precio)
-- Costo: $0 vs tokens de OpenAI por cada scrape
-- Velocidad: parseo instantaneo vs llamada API
-- Mantenimiento: cuando cambia el HTML, solo actualizas el selector (no re-entrenas)
-- LLM queda como fallback futuro para sitios muy dinamicos
+- Costo: $0 vs tokens de LLM por cada scrape (incluso con Firecrawl self-hosted)
+- Velocidad: parseo instantaneo con cheerio vs overhead de LLM
+- Mantenimiento: cuando cambia el HTML, solo actualizas el selector
+- LLM queda como fallback futuro para sitios muy dinamicos o sin patron claro
 
 ## Estimacion de Recursos
 

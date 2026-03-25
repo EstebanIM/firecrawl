@@ -194,15 +194,10 @@ Sin configuracion adicional: HTTP → HTTPS redirect incluido.
 
 ```dockerfile
 # Dockerfile
+# NOTA: PrecioChile NO usa Playwright — el scraping se delega a Firecrawl self-hosted.
+# La imagen es mucho mas pequena (sin deps de Chromium).
 
 FROM node:22-slim AS base
-RUN apt-get update && apt-get install -y \
-    # Dependencias de Playwright Chromium
-    libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
-    libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-    libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
-    libasound2 libatspi2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
 
 # Instalar pnpm
 ENV PNPM_HOME="/pnpm"
@@ -218,9 +213,6 @@ COPY package.json pnpm-lock.yaml ./
 FROM base AS deps
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 
-# Instalar Playwright browser (solo Chromium)
-RUN npx playwright install chromium
-
 # Build
 FROM deps AS build
 COPY . .
@@ -231,7 +223,6 @@ RUN pnpm build
 FROM base AS runner
 ENV NODE_ENV=production
 
-COPY --from=deps /root/.cache/ms-playwright /root/.cache/ms-playwright
 # standalone incluye node_modules minificado — no copiar node_modules completo
 COPY --from=build /app/.next/standalone ./
 COPY --from=build /app/.next/static ./.next/static
